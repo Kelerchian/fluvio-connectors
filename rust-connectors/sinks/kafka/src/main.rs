@@ -1,13 +1,17 @@
 use fluvio_connectors_common::git_hash_version;
 use fluvio_connectors_common::opt::CommonConnectorOpt;
+use fluvio_future::tracing::log::Record;
 use fluvio_future::tracing::{error, info};
 use rdkafka::config::ClientConfig;
 use rdkafka::producer::{FutureProducer, FutureRecord};
 use schemars::schema_for;
 use schemars::JsonSchema;
+use std::default::Default;
+use std::marker::PhantomData;
 use std::sync::Arc;
 use std::time::Duration;
 use structopt::StructOpt;
+use tokio::task::JoinHandle;
 use tokio_stream::StreamExt;
 
 #[tokio::main]
@@ -42,40 +46,152 @@ async fn main() -> anyhow::Result<()> {
     // That expect things moved inside to be static
     // An optimization point for this would be to own the runtime (rather than calling tokio::*)
     // So that runtime::spawn does not need producer to be in Arc
-    let kafka_sink_deps = KafkaSinkDependencies::from_kafka_opt(raw_opts).await?;
-
-    // =======================================================
-    // Streaming sequence starts here
-    // =======================================================
+    let kafka_sink_deps = Arc::new(KafkaSinkDependencies::from_kafka_opt(raw_opts).await?);
 
     info!("Starting stream");
+
+    // =======================================================
+    // Preparing Stream from fluvio
+    // =======================================================
 
     let mut stream = kafka_sink_deps
         .common_connector_opt
         .create_consumer_stream()
         .await?;
 
-    while let Some(Ok(record)) = stream.next().await {
-        // Clone arcs to be sent to async block's scopes
-        let producer = kafka_sink_deps.kafka_producer.clone();
-        let kafka_partition = kafka_sink_deps.kafka_partition.clone();
-        let kafka_topic = kafka_sink_deps.kafka_topic.clone();
+    // =======================================================
+    // Preparing Future Pool Observer
+    // =======================================================
 
-        tokio::spawn(async move {
-            let mut kafka_record = FutureRecord::to(kafka_topic.as_str())
-                .payload(record.value())
-                .key(record.key().unwrap_or(&[]));
-            if let Some(kafka_partition) = &(*kafka_partition) {
-                kafka_record = kafka_record.partition(*kafka_partition);
+    let future_pool_overseer: Arc<tokio::sync::RwLock<FutureMemoryUsageOverseer<_>>> =
+        Default::default();
+    let memory_usage_highwatermark: usize = 1000; // in bytes
+    let memory_usage_inspection_rate = std::time::Duration::from_millis(500);
+    let last_memory_usage_inspection = std::time::Instant::now();
+
+    // =======================================================
+    // Streaming sequence starts here
+    // =======================================================
+
+    loop {
+        let memory_usage_highwatermark_passed = {
+            let overseer_reader = future_pool_overseer.read().await;
+            (&(*overseer_reader)).get_current_memory_usage() >= memory_usage_highwatermark
+        };
+
+        if memory_usage_highwatermark_passed
+            && last_memory_usage_inspection.elapsed() > memory_usage_inspection_rate
+        {
+            let mut overseer_writer = future_pool_overseer.write().await;
+            overseer_writer.sweep();
+        } else {
+            match stream.next().await {
+                Some(Ok(record)) => {
+                    // Clone arcs to be sent to async block's scopes
+
+                    let kafka_sink_deps = kafka_sink_deps.clone();
+                    let kafka_topic = kafka_sink_deps.kafka_topic.clone();
+                    let kafka_partition = kafka_sink_deps.kafka_partition.clone();
+                    let kafka_producer = kafka_sink_deps.kafka_producer.clone();
+                    let memory_usage = record.value().len() + std::mem::size_of::<Record>();
+
+                    let future = async move {
+                        let mut kafka_record = FutureRecord::to(&(*kafka_topic).as_str())
+                            .payload(record.value().clone())
+                            .key(record.key().unwrap_or(&[]));
+                        if let Some(kafka_partition) = &(*kafka_partition) {
+                            kafka_record = kafka_record.partition(*kafka_partition);
+                        }
+                        let res = kafka_producer
+                            .send(kafka_record, Duration::from_secs(0))
+                            .await;
+                        if let Err(e) = &res {
+                            error!("Kafka produce {:?}", e)
+                            // TODO: handle error based on the subtype of e
+                        }
+
+                        res
+                    };
+                    let join_handle: JoinHandle<_> = tokio::spawn(future);
+
+                    {
+                        let mut overseer_writer = future_pool_overseer.write().await;
+                        overseer_writer.push(FutureJoinHandlePair {
+                            join_handle,
+                            memory_usage,
+                        })
+                    }
+                }
+                Some(Err(_error_code)) => {
+                    // TODO: explain error from stream
+                    // TODO: handle error based on code
+                    break;
+                }
+                None => {
+                    // Simply continue
+                }
             }
-            let res = producer.send(kafka_record, Duration::from_secs(0)).await;
-            if let Err(e) = res {
-                error!("Kafka produce {:?}", e)
-            }
-        });
+        }
     }
 
     Ok(())
+}
+
+pub struct FutureJoinHandlePair<T> {
+    join_handle: JoinHandle<T>,
+    memory_usage: usize,
+}
+
+pub struct FutureMemoryUsageOverseer<'a, T> {
+    /// Pair of JoinHandle and MemoryUsage (a usize)
+    pub unfinished_join_handle_pool: Vec<FutureJoinHandlePair<T>>,
+    memoized_used_memory: usize,
+    _self_lifetime: PhantomData<&'a ()>,
+}
+
+impl<'a, T> FutureMemoryUsageOverseer<'a, T> {
+    fn push(&mut self, pair: FutureJoinHandlePair<T>) -> () {
+        // Push new JoinHandle-MemoryUsage pair
+        self.memoized_used_memory += pair.memory_usage;
+        self.unfinished_join_handle_pool.push(pair);
+    }
+
+    fn sweep(&mut self) -> () {
+        // Take finished JoinHandle-MemoryUsage pairs
+        let mut old_pairs: Vec<FutureJoinHandlePair<T>> = vec![];
+        let mut finished_pairs: Vec<FutureJoinHandlePair<T>> = vec![];
+
+        std::mem::swap(&mut self.unfinished_join_handle_pool, &mut old_pairs);
+
+        old_pairs.into_iter().for_each(|pair| {
+            if pair.join_handle.is_finished() {
+                finished_pairs.push(pair);
+            } else {
+                self.unfinished_join_handle_pool.push(pair);
+            }
+        });
+
+        // Reduced "memoized_used_memory" by records of MemoryUsage from finished pairs
+        let freed_memory = finished_pairs
+            .into_iter()
+            .fold(0, |freed_memory, pair| freed_memory + pair.memory_usage);
+
+        self.memoized_used_memory -= freed_memory;
+    }
+
+    fn get_current_memory_usage(&self) -> usize {
+        self.memoized_used_memory.clone()
+    }
+}
+
+impl<'a, T> Default for FutureMemoryUsageOverseer<'a, T> {
+    fn default() -> Self {
+        FutureMemoryUsageOverseer {
+            unfinished_join_handle_pool: Default::default(),
+            memoized_used_memory: 0,
+            _self_lifetime: Default::default(),
+        }
+    }
 }
 
 #[derive(StructOpt, Debug, JsonSchema, Clone)]
@@ -103,7 +219,7 @@ pub struct KafkaSinkDependencies {
     pub kafka_topic: Arc<String>,
     pub kafka_partition: Arc<Option<i32>>,
     pub kafka_producer: Arc<FutureProducer>,
-    pub common_connector_opt: CommonConnectorOpt,
+    pub common_connector_opt: Arc<CommonConnectorOpt>,
 }
 
 impl KafkaSinkDependencies {
@@ -162,7 +278,7 @@ impl KafkaSinkDependencies {
             kafka_topic: Arc::new(kafka_topic),
             kafka_partition: Arc::new(kafka_partition),
             kafka_producer: Arc::new(kafka_producer),
-            common_connector_opt,
+            common_connector_opt: Arc::new(common_connector_opt),
         })
     }
 }
